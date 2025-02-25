@@ -1,10 +1,17 @@
 package keeper_test
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/grpc"
 
 	"cosmossdk.io/collections"
 	sdkmath "cosmossdk.io/math"
@@ -21,6 +28,50 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/gov/types/v1beta1"
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
 )
+
+// GrpcGatewayTestHelper is a test helper for testing gRPC-gateway functionality
+type GrpcGatewayTestHelper struct {
+	Mux    *runtime.ServeMux
+	Client *http.Client
+	Server *httptest.Server
+}
+
+// RegisterService registers a gRPC service's gateway handlers
+func (h *GrpcGatewayTestHelper) RegisterService(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption, registerFunc func(context.Context, *runtime.ServeMux, string, []grpc.DialOption) error) error {
+	return registerFunc(ctx, mux, endpoint, opts)
+}
+
+// NewGrpcGatewayTestHelper creates a new GrpcGatewayTestHelper
+func NewGrpcGatewayTestHelper(ctx context.Context) *GrpcGatewayTestHelper {
+	mux := runtime.NewServeMux()
+	helper := &GrpcGatewayTestHelper{
+		Mux:    mux,
+		Client: &http.Client{},
+	}
+
+	// Create a wrapped http handler that injects the SDK context
+	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(ctx)
+		mux.ServeHTTP(w, r)
+	})
+
+	server := httptest.NewServer(wrappedHandler)
+	helper.Server = server
+	return helper
+}
+
+func (suite *KeeperTestSuite) SetupGrpcGateway() {
+	// Set up a gateway test helper
+	suite.gatewayHelper = NewGrpcGatewayTestHelper(suite.ctx)
+
+	// Register the v1 gateway handlers with the wrapped SDK context
+	err := v1.RegisterQueryHandlerServer(suite.ctx, suite.gatewayHelper.Mux, keeper.NewQueryServer(suite.govKeeper))
+	suite.Require().NoError(err)
+
+	// Register the v1beta1 gateway handlers with the wrapped SDK context
+	err = v1beta1.RegisterQueryHandlerServer(suite.ctx, suite.gatewayHelper.Mux, keeper.NewLegacyQueryServer(suite.govKeeper))
+	suite.Require().NoError(err)
+}
 
 var address1 = "cosmos1ghekyjucln7y67ntx7cf27m9dpuxxemn4c8g4r"
 
@@ -39,10 +90,27 @@ type KeeperTestSuite struct {
 	addrs             []sdk.AccAddress
 	msgSrvr           v1.MsgServer
 	legacyMsgSrvr     v1beta1.MsgServer
+	gatewayHelper     *GrpcGatewayTestHelper
 }
 
 func (suite *KeeperTestSuite) SetupSuite() {
 	suite.reset()
+	suite.SetupGrpcGateway()
+}
+
+// TestGrpcGateway tests the gRPC gateway functionality
+func (suite *KeeperTestSuite) TestGrpcGateway() {
+	// Test a v1 endpoint
+	url := fmt.Sprintf("%s/cosmos/gov/v1/proposals", suite.gatewayHelper.Server.URL)
+	url += "?proposal_status=PROPOSAL_STATUS_FAILED"
+	resp, err := suite.gatewayHelper.Client.Get(url)
+	suite.Require().NoError(err)
+	suite.Require().Equal(http.StatusOK, resp.StatusCode)
+
+	var proposalsResp v1.QueryProposalsResponse
+	err = json.NewDecoder(resp.Body).Decode(&proposalsResp)
+	suite.Require().NoError(err)
+	resp.Body.Close()
 }
 
 func (suite *KeeperTestSuite) reset() {
